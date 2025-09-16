@@ -4,7 +4,7 @@ Pydantic schemas for configuration, settings, and API validation.
 
 from datetime import time
 from typing import List, Optional, Dict, Any
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, validator, AliasChoices
 from pydantic_settings import BaseSettings
 
 
@@ -16,6 +16,7 @@ class TruckConfig(BaseModel):
     bed_width_ft: float = Field(gt=0)
     height_limit_ft: Optional[float] = Field(default=None, gt=0)
     large_capable: bool = Field(default=False)
+    large_truck: bool = Field(default=False, description="Whether this is a large truck subject to municipal restrictions")
 
 
 class WorkdayWindow(BaseModel):
@@ -107,6 +108,8 @@ class SolverConfig(BaseModel):
     single_truck_mode: int = Field(default=0, ge=0, le=1)
     trucks_used_penalty: float = Field(default=1000.0, ge=0)
     random_seed: int = Field(default=42)
+    # Normalized balance control (0=Optimal/performance, 1=Balanced, 2=Priority)
+    balance_slider: Optional[float] = Field(default=1.0, ge=0, le=2, description="0=Optimal,1=Balanced,2=Priority")
     # Multi-objective weights
     weights: Optional[SolverWeightsConfig] = None
     # Legacy weights (for backward compatibility)
@@ -136,6 +139,21 @@ class GoogleConfig(BaseModel):
     retry_delay_seconds: float = Field(default=1.0, gt=0)
     rate_limit_requests_per_second: int = Field(default=10, ge=1, le=100)
     maps: GoogleMapsConfig = Field(default_factory=GoogleMapsConfig)
+
+
+class RoutingProviderConfig(BaseModel):
+    """Routing provider configuration."""
+    provider: str = Field(default="osrm", pattern="^(here|ors|osrm|straight)$")
+    here_api_key: Optional[str] = Field(default=None)
+    ors_api_key: Optional[str] = Field(default=None)
+    city_rules_file: str = Field(default="./config/city_rules.yaml")
+
+
+class CityRule(BaseModel):
+    """City-specific truck restriction rule."""
+    name: str
+    polygon: List[List[float]]  # [[lat, lon], [lat, lon], ...]
+    restrictions: Dict[str, Any]  # e.g., {"large_truck_entry_before": "08:00"}
 
 
 class DatabaseConfig(BaseModel):
@@ -179,6 +197,7 @@ class AppConfig(BaseModel):
     overtime_deferral: OvertimeDeferralConfig
     solver: SolverConfig
     google: GoogleConfig
+    routing: Optional[RoutingProviderConfig] = Field(default_factory=lambda: RoutingProviderConfig())
     database: DatabaseConfig
     logging: LoggingConfig
     dev: DevConfig = Field(default_factory=DevConfig)
@@ -219,11 +238,19 @@ class OptimizeRequest(BaseModel):
     date: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")  # YYYY-MM-DD
     auto: str = Field(default="ask", pattern="^(ask|overtime|defer)$")
     seed: Optional[int] = Field(default=None)
-    single_truck_mode: bool = Field(default=False)
-    solver_strategy: str = Field(default="greedy")
+    # Accept both 'single_truck_mode' and 'single_truck' from clients
+    single_truck_mode: bool = Field(default=False, validation_alias=AliasChoices("single_truck_mode", "single_truck"))
+    solver_strategy: str = Field(default="pyvrp")
+    debug: Optional[bool] = Field(default=False, description="Enable verbose debug logging and route.debug payload")
     trace: bool = Field(default=False)
     visualize: bool = Field(default=False)
     output_dir: str = Field(default="runs")
+    time_windows_only: bool = Field(default=False, description="Ignore capacity and capability constraints; enforce only time windows")
+    # Optional runtime overrides for priority-vs-performance tradeoff
+    priority_trade_off: Optional[float] = Field(default=None, ge=0, description="Override for solver.priority.performance_trade_off for this run")
+    priority_soft_cost: Optional[float] = Field(default=None, ge=0, description="Override for solver.weights.priority_soft_cost for this run")
+    # Normalized balance slider s in [0,2]: 0=favor performance, 1=balanced, 2=favor priority
+    balance_slider: Optional[float] = Field(default=None, ge=0, le=2, description="Slider controlling priority vs performance: 0=performance, 1=balanced, 2=priority")
 
 
 class ConfigUpdateRequest(BaseModel):
@@ -254,6 +281,35 @@ class KPIResponse(BaseModel):
     jobs_unassigned: int
     efficiency_score: float  # Computed metric
     priority_score: float    # Computed metric
+
+
+class OvertimeDecision(BaseModel):
+    """Overtime decision details for a truck."""
+    truck_id: int
+    truck_name: str
+    day_total_minutes: float
+    overtime_used_minutes: float
+    stops: List[Dict[str, Any]]
+    can_fit_with_60min_overtime: bool
+
+
+class DeferJob(BaseModel):
+    """Request to defer a job to next day."""
+    job_id: int
+    new_priority: Optional[int] = Field(default=None, ge=0, le=3)
+
+
+class BulkDeferRequest(BaseModel):
+    """Request to defer multiple jobs."""
+    jobs: List[DeferJob]
+
+
+class DeferredJob(BaseModel):
+    """Deferred job details surfaced when capacity/time fallback defers remaining work."""
+    id: int
+    priority: int
+    reason: str = Field(description="Reason for deferral e.g. deferred_due_to_capacity_time")
+    suggested_date: str = Field(description="Next work day (YYYY-MM-DD) the job is suggested to be scheduled")
 
 
 class HealthResponse(BaseModel):

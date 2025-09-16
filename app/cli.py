@@ -403,5 +403,63 @@ def visualize(ctx, date: str, output_dir: str, format: str):
     asyncio.run(_visualize())
 
 
+@main.command()
+@click.option('--prefix', default='Test', help='Truck name prefix to delete (default: "Test")')
+@click.option('--dry-run', is_flag=True, help='List trucks that would be deleted without deleting')
+@click.option('--include-active', is_flag=True, help='Also delete trucks even if they have active/future assignments (their assignments will be removed)')
+@click.pass_context
+def cleanup_trucks(ctx, prefix: str, dry_run: bool, include_active: bool):
+    """Delete trucks whose names start with a given prefix, along with their assignments.
+
+    By default, active/future assignments block deletion and those trucks are skipped.
+    Use --include-active to force deletion (assignments will be removed first).
+    """
+
+    async def _cleanup():
+        service = TruckOptimizerService(ctx.obj['config_path'])
+        try:
+            click.echo(f"Finding trucks with prefix '{prefix}'...")
+            trucks = service.repo.get_trucks_by_name_prefix(prefix)
+            if not trucks:
+                click.echo("No matching trucks found.")
+                return
+            from datetime import datetime as _dt
+            today = _dt.now().date()
+            deleted = 0
+            skipped = 0
+            for t in trucks:
+                assignments = service.repo.get_route_assignments_for_truck(t.id)
+                has_active_or_future = False
+                for a in assignments:
+                    try:
+                        a_date = _dt.fromisoformat(f"{a.date}T00:00:00").date()
+                    except Exception:
+                        a_date = today
+                    if a_date >= today:
+                        has_active_or_future = True
+                        break
+                if has_active_or_future and not include_active:
+                    click.echo(f"Skip '{t.name}' (id={t.id}) — has active/future assignments (use --include-active to force)")
+                    skipped += 1
+                    continue
+                if dry_run:
+                    click.echo(f"Would delete '{t.name}' (id={t.id}) and {'all' if include_active else 'past'} assignments ({len(assignments)} records)")
+                    continue
+                if service.repo.delete_truck_and_assignments(t.id):
+                    click.echo(f"Deleted '{t.name}' (id={t.id})")
+                    deleted += 1
+                else:
+                    click.echo(f"Failed to delete '{t.name}' (id={t.id})")
+            if not dry_run:
+                click.echo(f"Done. Deleted={deleted}, Skipped(blocked)={skipped}")
+        except Exception as e:
+            logger.error(f"Cleanup failed: {e}")
+            raise click.ClickException(str(e))
+        finally:
+            await service.close()
+
+    asyncio.run(_cleanup())
+
+
 if __name__ == '__main__':
     main()

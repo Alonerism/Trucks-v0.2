@@ -217,13 +217,14 @@ def test_time_window_validation():
     job_items = []
     current_load = LoadInfo()
     
-    # Test arrival too early
+    # Test arrival too early - should NOT be a violation (waiting is allowed)
     early_time = datetime(2025, 9, 1, 13, 0)  # 1 PM
     violations = validator.validate_job_assignment(
         job, job_items, truck, current_load, early_time
     )
     
-    assert any(v.violation_type == "too_early" for v in violations)
+    # Early arrival should NOT generate violations (waiting is allowed)
+    assert not any(v.violation_type == "too_early" for v in violations)
     
     # Test arrival too late
     late_time = datetime(2025, 9, 1, 17, 0)  # 5 PM

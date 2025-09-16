@@ -1,0 +1,28 @@
+{
+  "locations": [
+    {"id": 1, "name": "Depot", "address": "Depot", "lat": 34.0500, "lon": -118.2500},
+    {"id": 2, "name": "Far P1 A", "lat": 34.2000, "lon": -118.4500},
+    {"id": 3, "name": "Far P1 B", "lat": 34.2100, "lon": -118.4600},
+    {"id": 4, "name": "Mid P2 A", "lat": 34.1200, "lon": -118.3000},
+    {"id": 5, "name": "Mid P2 B", "lat": 34.1250, "lon": -118.3050},
+    {"id": 6, "name": "Mid P2 C", "lat": 34.1300, "lon": -118.3100},
+    {"id": 7, "name": "Near P3 A", "lat": 34.0550, "lon": -118.2550},
+    {"id": 8, "name": "Near P3 B", "lat": 34.0560, "lon": -118.2560},
+    {"id": 9, "name": "Near P3 C", "lat": 34.0570, "lon": -118.2570},
+    {"id": 10, "name": "Near P3 D", "lat": 34.0580, "lon": -118.2580},
+    {"id": 11, "name": "Near P3 E", "lat": 34.0590, "lon": -118.2590}
+  ],
+  "jobs": [
+    {"id": 1, "location_id": 2, "priority": 1, "action": "pickup"},
+    {"id": 2, "location_id": 3, "priority": 1, "action": "pickup"},
+    {"id": 3, "location_id": 4, "priority": 2, "action": "pickup"},
+    {"id": 4, "location_id": 5, "priority": 2, "action": "pickup"},
+    {"id": 5, "location_id": 6, "priority": 2, "action": "pickup"},
+    {"id": 6, "location_id": 7, "priority": 3, "action": "pickup"},
+    {"id": 7, "location_id": 8, "priority": 3, "action": "pickup"},
+    {"id": 8, "location_id": 9, "priority": 3, "action": "pickup"},
+    {"id": 9, "location_id": 10, "priority": 3, "action": "pickup"},
+    {"id": 10, "location_id": 11, "priority": 3, "action": "pickup"},
+    {"id": 11, "location_id": 7, "priority": 0, "action": "pickup"}
+  ]
+}

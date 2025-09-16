@@ -1,0 +1,10 @@
+__pycache__
+.pytest_cache
+.mypy_cache
+.venv
+*.pyc
+*.pyo
+.git
+dist
+build
+truck_optimizer.db

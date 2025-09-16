@@ -1,0 +1,18 @@
+project:
+  name: Fleet Minimal
+solver:
+  type: pyvrp
+  random_seed: 42
+dispatch:
+  batch_size: 3
+ml_calibration:
+  enabled: true
+  min_batches_to_train: 10
+  retrain_every_batches: 10
+database:
+  url: "sqlite:///./app.db"
+logging:
+  level: "INFO"
+workday:
+  start: "07:00"
+  end: "16:30"

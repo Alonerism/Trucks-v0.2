@@ -30,6 +30,9 @@ class JobAssignment:
     drive_minutes_from_previous: float
     service_minutes: float
     location_index: int  # Index in distance matrix
+    wait_minutes: float = 0.0
+    slack_minutes: float = 0.0
+    leg_distance_meters: float = 0.0
     
     def __eq__(self, other) -> bool:
         """Compare assignments by job ID to avoid Pydantic comparison issues."""
@@ -68,38 +71,97 @@ class TruckRoute:
         return self.total_drive_minutes + self.total_service_minutes
     
     def calculate_cost(self, config: AppConfig) -> float:
-        """Calculate route cost using multi-objective weighted function."""
+        """Calculate route cost using multi-objective weighted function.
+        If a normalized balance slider is provided (config.solver.balance_slider in [0,2]),
+        combine normalized travel vs priority costs using symmetric weights f and g.
+        Otherwise, fall back to weighted sum using configured weights.
+        """
         # Use multi-objective weights if defined
         if hasattr(config.solver, "weights"):
-            # Multi-objective weighted sum
+            # Base components
             drive_cost = self.total_drive_minutes * config.solver.weights.drive_minutes
             service_cost = self.total_service_minutes * config.solver.weights.service_minutes
             overtime_cost = self.overtime_minutes * config.solver.weights.overtime_minutes
-            max_route_cost = self.total_time_minutes * config.solver.weights.max_route_minutes
-            
-            # Priority cost (higher priority jobs earlier = lower cost)
-            priority_cost = 0.0
+            # FIXME: max_route_cost causes issues with inflated time calculations
+            # max_route_cost = self.total_time_minutes * config.solver.weights.max_route_minutes
+            max_route_cost = 0.0
+
+            # Priority cost (lower priority numbers = higher urgency = lower cost)
+            # Priority 0 = Critical (must be first), 1 = Most urgent, 3 = Least urgent
+            raw_priority = 0.0
             for i, assignment in enumerate(self.assignments):
-                # Later positions get higher cost, weighted by inverse priority
                 position_penalty = i + 1
-                priority_weight = 1.0 / max(assignment.job.priority, 1)
-                priority_cost += position_penalty * priority_weight
-            
-            priority_cost *= config.solver.weights.priority_soft_cost
-            
-            return drive_cost + service_cost + overtime_cost + max_route_cost + priority_cost
+                if hasattr(config.solver, 'priority') and hasattr(config.solver.priority, 'urgency_weights'):
+                    uw = config.solver.priority.urgency_weights
+                    if assignment.job.priority == 0:
+                        pw = uw.critical
+                    elif assignment.job.priority == 1:
+                        pw = uw.high
+                    elif assignment.job.priority == 2:
+                        pw = uw.medium
+                    else:
+                        pw = uw.low
+                else:
+                    pw = 10.0 if assignment.job.priority == 0 else (4.0 - assignment.job.priority)
+                raw_priority += position_penalty * pw
+            if hasattr(config.solver, 'priority') and hasattr(config.solver.priority, 'performance_trade_off'):
+                raw_priority *= config.solver.priority.performance_trade_off
+
+            # If balance slider is set, normalize and combine
+            s = getattr(config.solver, 'balance_slider', None)
+            if isinstance(s, (int, float)):
+                # Normalized travel = drive+service vs overtime preserved separately (overtime hard penalty)
+                travel_raw = drive_cost + service_cost
+                # Avoid division by zero; normalize by 1 + value to keep in (0,1] scale
+                travel_norm = travel_raw / (1.0 + travel_raw)
+                priority_soft = raw_priority * config.solver.weights.priority_soft_cost
+                priority_norm = priority_soft / (1.0 + priority_soft)
+                # Symmetric weights around s=1
+                f = 10 ** (1 - s)  # performance weight
+                g = 10 ** (s - 1)  # priority weight
+                total_cost = overtime_cost + max_route_cost + (f * travel_norm) + (g * priority_norm)
+                return total_cost
+            else:
+                # Default weighted sum
+                priority_cost = raw_priority * config.solver.weights.priority_soft_cost
+                total_cost = drive_cost + service_cost + overtime_cost + max_route_cost + priority_cost
+                print(f"Greedy Route Cost: drive={drive_cost:.2f}, service={service_cost:.2f}, overtime={overtime_cost:.2f}, priority={priority_cost:.2f}, total={total_cost:.2f}")
+                return total_cost
         else:
             # Legacy cost function for backward compatibility
             efficiency_cost = (self.total_drive_minutes + self.total_service_minutes) * config.solver.efficiency_weight
             overtime_cost = self.overtime_minutes * config.solver.overtime_penalty_per_minute
             
-            # Priority cost (higher priority jobs earlier = lower cost)
+            # Priority cost (lower priority numbers = higher urgency = lower cost)
+            # Priority 0 = Critical (must be first), 1 = Most urgent, 3 = Least urgent
             priority_cost = 0.0
             for i, assignment in enumerate(self.assignments):
-                # Later positions get higher cost, weighted by inverse priority
+                # Later positions get higher cost, weighted by priority urgency
                 position_penalty = i + 1
-                priority_weight = 1.0 / max(assignment.job.priority, 1)
+                
+                # Get priority weights from config
+                if hasattr(config.solver, 'priority') and hasattr(config.solver.priority, 'urgency_weights'):
+                    urgency_weights = config.solver.priority.urgency_weights
+                    if assignment.job.priority == 0:
+                        priority_weight = urgency_weights.critical
+                    elif assignment.job.priority == 1:
+                        priority_weight = urgency_weights.high
+                    elif assignment.job.priority == 2:
+                        priority_weight = urgency_weights.medium
+                    else:  # priority 3
+                        priority_weight = urgency_weights.low
+                else:
+                    # Fallback to hardcoded weights
+                    if assignment.job.priority == 0:
+                        priority_weight = 10.0  
+                    else:
+                        priority_weight = 4.0 - assignment.job.priority
+                
                 priority_cost += position_penalty * priority_weight
+            
+            # Apply performance trade-off multiplier
+            if hasattr(config.solver, 'priority') and hasattr(config.solver.priority, 'performance_trade_off'):
+                priority_cost *= config.solver.priority.performance_trade_off
             
             priority_cost *= config.solver.priority_weight
             
@@ -230,6 +292,16 @@ class GreedySolver:
             )
         
         # Calculate final costs and metrics with the new multi-objective function
+        # Final pass: ensure stable ordering by priority within routes and recompute timings
+        for route in routes:
+            if len(route.assignments) > 1:
+                before = [a.job.id for a in route.assignments]
+                route.assignments.sort(key=lambda a: a.job.priority)
+                after = [a.job.id for a in route.assignments]
+                if before != after:
+                    print(f"Final ordering applied on {route.truck.name}: {before} -> {after}")
+                self._recalculate_route_metrics(route, distance_matrix, workday_start)
+
         total_cost = sum(route.calculate_cost(self.config) for route in routes if route.assignments)
         
         # Add single truck mode penalty if applicable
@@ -273,31 +345,94 @@ class GreedySolver:
         trace_data: Optional[Dict] = None
     ) -> List[Job]:
         """Greedy construction phase using nearest neighbor heuristic."""
-        unassigned_jobs = []
-        remaining_jobs = jobs.copy()
+        unassigned_jobs: List[Job] = []
+        remaining_jobs: List[Job] = jobs.copy()
         
-        # Sort jobs by priority (descending) as initial preference
-        remaining_jobs.sort(key=lambda j: j.priority, reverse=True)
+        # Lower numeric priority should come first (0 critical -> 3 low)
+        remaining_jobs.sort(key=lambda j: j.priority)
+        print(f"Greedy Construction: Processing jobs in priority order:")
+        for job in remaining_jobs:
+            print(f"  Job {job.id}: P{job.priority} - {job.location.name} ({job.action})")
         
+        # Two-phase filling:
+        # Phase 1: Fill trucks up to (workday_length - buffer)
+        # Phase 2: Allow up to (workday_length + buffer) then defer
+        ws = workday_start
+        we = workday_start.replace(
+            hour=int(self.config.depot.workday_window.end[:2]),
+            minute=int(self.config.depot.workday_window.end[3:]),
+            second=0
+        )
+        workday_length_min = max(0, int((we - ws).total_seconds() / 60))
+        buffer_min = int(getattr(self.config.overtime_deferral, 'overtime_slack_minutes', 30) or 30)
+        cap_phase1 = max(0, workday_length_min - buffer_min)
+        cap_phase2 = workday_length_min + buffer_min
+        phase = 1
+        # We'll iterate through jobs allowing assignment under current cap; if stuck, advance phase
         while remaining_jobs:
-            job = remaining_jobs.pop(0)
-            job_items = job_items_map[job.id]
-            
-            # Find best truck assignment
-            best_truck_idx, best_cost, _ = self._find_best_truck_assignment(
-                job, job_items, routes, location_to_index, distance_matrix, workday_start, trace_data
-            )
-            
-            if best_truck_idx is not None:
-                # Assign job to best truck
-                self._assign_job_to_route(
-                    job, job_items, routes[best_truck_idx], 
-                    location_to_index, distance_matrix, workday_start
+            assigned_this_round = False
+            next_remaining: List[Job] = []
+            for job in remaining_jobs:
+                job_items = job_items_map[job.id]
+                print(f"Processing Job {job.id}: P{job.priority} - {job.location.name}")
+                
+                # Try assign under current cap
+                cap = cap_phase1 if phase == 1 else cap_phase2
+                best_truck_idx, best_cost, _ = self._find_best_truck_assignment(
+                    job, job_items, routes, location_to_index, distance_matrix, workday_start, trace_data,
+                    enforce_time_cap=True, cap_minutes=cap
                 )
-            else:
-                # Cannot assign this job
-                unassigned_jobs.append(job)
-                logger.debug(f"Could not assign job {job.id} - constraint violations")
+                if best_truck_idx is not None:
+                    self._assign_job_to_route(
+                        job, job_items, routes[best_truck_idx],
+                        location_to_index, distance_matrix, workday_start
+                    )
+                    assigned_this_round = True
+                else:
+                    # Keep for next round or next phase
+                    next_remaining.append(job)
+            remaining_jobs = next_remaining
+            if not remaining_jobs:
+                break
+            if not assigned_this_round:
+                if phase == 1:
+                    # Move to overtime-cap phase
+                    phase = 2
+                else:
+                    # Nothing can be assigned even with overtime cap; mark remaining unassigned
+                    unassigned_jobs.extend(remaining_jobs)
+                    logger.debug(f"Could not assign {len(remaining_jobs)} remaining jobs within caps - deferring")
+                    break
+        
+        # Post-process: Sort jobs within each route by priority for same locations
+        print("Post-processing: Sorting jobs by priority within routes...")
+        for route in routes:
+            if len(route.assignments) > 1:
+                # Group assignments by location, then sort each group by priority
+                location_groups = {}
+                for assignment in route.assignments:
+                    loc_id = assignment.job.location_id
+                    if loc_id not in location_groups:
+                        location_groups[loc_id] = []
+                    location_groups[loc_id].append(assignment)
+                
+                # Sort assignments within each location group by priority
+                for loc_id, group in location_groups.items():
+                    if len(group) > 1:
+                        group.sort(key=lambda a: a.job.priority)
+                        print(f"  Sorted {len(group)} jobs at location {loc_id} by priority")
+                
+                # Rebuild the route assignments maintaining location grouping but priority ordering
+                # For simplicity, just sort the entire route by priority
+                print(f"  Before sort: {[f'Job{a.job.id}(P{a.job.priority})' for a in route.assignments]}")
+                route.assignments.sort(key=lambda a: a.job.priority)
+                print(f"  After sort:  {[f'Job{a.job.id}(P{a.job.priority})' for a in route.assignments]}")
+                print(f"  Route {route.truck.name}: Reordered {len(route.assignments)} jobs by priority")
+                # Recompute timings after reorder
+                try:
+                    self._recalculate_route_metrics(route, distance_matrix, workday_start)
+                except Exception as e:
+                    logger.warning(f"Failed to recompute timings after reorder on {route.truck.name}: {e}")
         
         return unassigned_jobs
         
@@ -404,7 +539,7 @@ class GreedySolver:
                 unassigned_jobs.extend(remaining_jobs)
                 logger.debug(f"Could not assign {len(remaining_jobs)} remaining jobs - constraint violations")
                 break
-                
+        
         return unassigned_jobs
     
     def _find_best_truck_assignment(
@@ -415,7 +550,9 @@ class GreedySolver:
         location_to_index: Dict[int, int],
         distance_matrix: RouteMatrix,
         workday_start: datetime,
-        trace_data: Optional[Dict] = None
+    trace_data: Optional[Dict] = None,
+    enforce_time_cap: bool = False,
+    cap_minutes: Optional[int] = None
     ) -> Tuple[Optional[int], float, Optional[Dict]]:
         """Find the best truck to assign a job to."""
         best_truck_idx = None
@@ -452,6 +589,22 @@ class GreedySolver:
             # Skip if constraint violations
             if violations:
                 continue
+
+            # Optional: enforce per-route total time cap (drive+service)
+            if enforce_time_cap and cap_minutes is not None:
+                # Estimate new totals if appended at end (approximation)
+                # Use evaluation best_position to compute incremental drive if available
+                est_drive_inc = 0.0
+                if route.assignments:
+                    prev_idx = route.assignments[-1].location_index
+                    est_drive_inc = distance_matrix.get_duration(prev_idx, job_location_idx)
+                else:
+                    est_drive_inc = distance_matrix.get_duration(0, job_location_idx)
+                est_service = self.validator.calculate_service_time(job_items)
+                est_total = route.total_drive_minutes + route.total_service_minutes + est_drive_inc + est_service
+                if est_total > cap_minutes:
+                    # Over cap; skip this truck in this phase
+                    continue
                 
             # Apply single truck mode preference if enabled
             if single_truck_mode:
@@ -522,6 +675,23 @@ class GreedySolver:
             violations = self.validator.validate_job_assignment(
                 job, job_items, route.truck, current_load, arrival_time
             )
+            # Account for waiting at earliest/location window and hard latest on service start
+            service_minutes = self.validator.calculate_service_time(job_items)
+            start_service_time = arrival_time
+            if job.earliest and start_service_time < job.earliest:
+                start_service_time = job.earliest
+            loc_ws = job.location.window_start
+            if loc_ws and start_service_time.time() < loc_ws:
+                start_service_time = start_service_time.replace(hour=loc_ws.hour, minute=loc_ws.minute, second=0)
+            if job.latest and start_service_time > job.latest:
+                # Too late to start service; treat infeasible
+                violations.append(ConstraintViolation(
+                    job_id=job.id,
+                    truck_id=route.truck.id,
+                    violation_type="too_late",
+                    message="Service start would occur after latest"
+                ))
+                cost = float('inf')
             
             # Store position evaluation for tracing
             if return_details:
@@ -534,7 +704,9 @@ class GreedySolver:
                 }
                 position_evaluations.append(position_eval)
             
-            if cost < best_cost and not violations:
+            if cost < best_cost and cost != float('inf') and not any(
+                v.violation_type in ("too_late", "location_window_late") for v in violations
+            ):
                 best_cost = cost
                 best_position = position
                 best_arrival_time = arrival_time
@@ -639,6 +811,7 @@ class GreedySolver:
         if not route.assignments:
             # First job
             drive_minutes = distance_matrix.get_duration(0, job_location_idx)
+            leg_distance_meters = float(distance_matrix.get_distance(0, job_location_idx)) if hasattr(distance_matrix, 'get_distance') else 0.0
             arrival_time = workday_start + timedelta(minutes=drive_minutes)
         else:
             # After previous job
@@ -646,9 +819,32 @@ class GreedySolver:
             drive_minutes = distance_matrix.get_duration(
                 prev_assignment.location_index, job_location_idx
             )
+            leg_distance_meters = float(distance_matrix.get_distance(prev_assignment.location_index, job_location_idx)) if hasattr(distance_matrix, 'get_distance') else 0.0
             arrival_time = prev_assignment.estimated_departure + timedelta(minutes=drive_minutes)
+        # Waiting if early relative to job/loc window start
+        wait_minutes = 0.0
+        start_service_time = arrival_time
+        if job.earliest and arrival_time < job.earliest:
+            wait_minutes = (job.earliest - arrival_time).total_seconds() / 60
+            start_service_time = job.earliest
+        # Location opening window
+        loc_ws = job.location.window_start
+        if loc_ws and start_service_time.time() < loc_ws:
+            # align to today's date context
+            start_service_time = start_service_time.replace(hour=loc_ws.hour, minute=loc_ws.minute, second=0)
+            wait_minutes = (start_service_time - arrival_time).total_seconds() / 60
         
-        departure_time = arrival_time + timedelta(minutes=service_minutes)
+        # Enforce hard latest: cannot start after latest
+        if job.latest and start_service_time > job.latest:
+            # Mark infeasible by raising; caller flow appends to unassigned elsewhere
+            # Here we fallback to no-op assignment by returning
+            return
+        
+        departure_time = start_service_time + timedelta(minutes=service_minutes)
+        # Slack vs latest
+        slack_minutes = None
+        if job.latest:
+            slack_minutes = (job.latest - start_service_time).total_seconds() / 60 - service_minutes
         
         # Create assignment
         assignment = JobAssignment(
@@ -660,7 +856,10 @@ class GreedySolver:
             estimated_departure=departure_time,
             drive_minutes_from_previous=drive_minutes,
             service_minutes=service_minutes,
-            location_index=job_location_idx
+            location_index=job_location_idx,
+            wait_minutes=max(0.0, float(wait_minutes)),
+            slack_minutes=float(slack_minutes) if slack_minutes is not None else 0.0,
+            leg_distance_meters=leg_distance_meters
         )
         
         # Add to route
@@ -1003,10 +1202,30 @@ class GreedySolver:
             # Update assignment timing
             assignment.stop_order = i
             assignment.drive_minutes_from_previous = drive_time
-            assignment.estimated_arrival = current_time + timedelta(minutes=drive_time)
-            assignment.estimated_departure = assignment.estimated_arrival + timedelta(
-                minutes=assignment.service_minutes
-            )
+            arrival = current_time + timedelta(minutes=drive_time)
+            # Wait if early
+            wait_minutes = 0.0
+            start_service = arrival
+            if assignment.job.earliest and arrival < assignment.job.earliest:
+                wait_minutes = (assignment.job.earliest - arrival).total_seconds() / 60
+                start_service = assignment.job.earliest
+            loc_ws = assignment.job.location.window_start
+            if loc_ws and start_service.time() < loc_ws:
+                start_service = start_service.replace(hour=loc_ws.hour, minute=loc_ws.minute, second=0)
+                wait_minutes = (start_service - arrival).total_seconds() / 60
+            assignment.wait_minutes = max(0.0, float(wait_minutes))
+            assignment.estimated_arrival = arrival
+            assignment.estimated_departure = start_service + timedelta(minutes=assignment.service_minutes)
+            # Slack
+            if assignment.job.latest:
+                assignment.slack_minutes = (
+                    (assignment.job.latest - start_service).total_seconds() / 60 - assignment.service_minutes
+                )
+            # Leg distance if available
+            if hasattr(distance_matrix, 'get_distance'):
+                assignment.leg_distance_meters = float(
+                    distance_matrix.get_distance(prev_location_idx, assignment.location_index)
+                )
             
             # Update route totals
             route.total_drive_minutes += drive_time

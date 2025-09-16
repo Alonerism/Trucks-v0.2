@@ -23,18 +23,21 @@ fleet:
       bed_width_ft: 8
       height_limit_ft: 9
       large_capable: true
+      large_truck: true  # Subject to municipal restrictions
     - name: "Small Truck A"
       max_weight_lb: 3500
       bed_len_ft: 8
       bed_width_ft: 5.5
       height_limit_ft: 8
       large_capable: false
+      large_truck: false
     - name: "Small Truck B"
       max_weight_lb: 3500
       bed_len_ft: 8
       bed_width_ft: 5.5
       height_limit_ft: 8
       large_capable: false
+      large_truck: false
 
 # Service time configurations (minutes)
 service_times:
@@ -96,7 +99,11 @@ overtime_deferral:
 # Solver configuration
 solver:
   # Primary solver selection
-  use_ortools: false  # Feature flag for OR-Tools vs greedy
+  type: "greedy"  # "greedy" or "ortools"
+  use_ortools: false  # Feature flag for OR-Tools vs greedy (deprecated, use type instead)
+  
+  # Scalability settings
+  max_jobs_per_optimization: 100  # Maximum jobs to include in one optimization run
   
   # Single truck mode
   single_truck_mode: 0  # 0=multi-truck, 1=prefer single truck
@@ -111,7 +118,22 @@ solver:
     service_minutes: 0.5
     overtime_minutes: 2.0
     max_route_minutes: 0.1
-    priority_soft_cost: 0.2
+    priority_soft_cost: 2.0  # How much to hurt performance for priority (0=ignore, 1.0=equal weight, 2.0=priority matters 2x)
+  
+  # Priority optimization settings
+  priority:
+    # How much performance to sacrifice for priority adherence
+    performance_trade_off: 1.0  # 0.0=pure optimization ignoring priority, 1.0=strong priority enforcement
+    
+    # Critical priority (0) handling
+    critical_priority_multiplier: 10.0  # Extra weight for critical jobs being placed late
+    
+    # Priority weights by level (how much penalty for late placement)
+    urgency_weights:
+      critical: 10.0   # Priority 0 - must be handled immediately
+      high: 3.0        # Priority 1 - most urgent
+      medium: 2.0      # Priority 2 - medium urgency  
+      low: 1.0         # Priority 3 - least urgent
   
   # Legacy weights (maintained for backward compatibility)
   efficiency_weight: 1.0  # Weight for (drive_minutes + service_minutes)
@@ -128,8 +150,77 @@ solver:
   # Local search parameters (for greedy solver)
   local_search_iterations: 100
   improvement_threshold: 0.01  # Minimum improvement to continue search
+  
+  # OR-Tools VRP solver parameters
+  ortools:
+    # Core solver configuration
+    time_limit_seconds: 60  # Maximum solver time
+    solution_limit: 100     # Maximum number of solutions to find
+    use_iterative_improvements: true  # Apply post-processing improvements
+    
+    # Search strategy
+    search_strategy: "AUTOMATIC"  # AUTOMATIC|PATH_CHEAPEST_ARC|PATH_MOST_CONSTRAINED_ARC|EVALUATOR_STRATEGY
+    
+    # Local search meta-heuristics
+    local_search:
+      enabled: true
+      operators: ["RELOCATE", "EXCHANGE", "CROSS", "TWO_OPT", "OR_OPT"]
+      guided_local_search: true
+      simulated_annealing: false
+      tabu_search: false
+      time_limit_ratio: 0.8  # Fraction of total time to spend on local search
+    
+    # Construction heuristics  
+    construction:
+      method: "SAVINGS"  # SAVINGS|PARALLEL_CHEAPEST_INSERTION|LOCAL_CHEAPEST_INSERTION|GLOBAL_CHEAPEST_ARC
+      use_sweep_angle: false
+      use_christofides: false
+      
+    # VRP model parameters
+    vehicle_routing:
+      time_dimension_coefficient: 1000  # Scaling factor for time dimension
+      capacity_dimension_coefficient: 1  # Scaling factor for capacity dimension
+      depot_penalty: 10000  # Penalty for returning to depot (encourages longer routes)
+      vehicle_usage_cost: 1000  # Fixed cost per vehicle used
+      
+      # Time window constraints
+      allow_soft_time_windows: false  # Allow violations with penalty
+      time_window_penalty: 10000  # Penalty per minute of time window violation
+      
+      # Capacity constraints
+      allow_soft_capacity: false  # Allow capacity violations with penalty
+      capacity_penalty: 1000  # Penalty per unit of capacity violation
+      
+    # Advanced search parameters
+    advanced:
+      # Solution diversification
+      cheapest_insertion_farthest_seeds_ratio: 0.0
+      cheapest_insertion_add_unperformed_entries: false
+      
+      # Arc cost configuration
+      arc_cost_coefficient_of_time_dimension: 0
+      arc_cost_coefficient_of_capacity_dimension: 0
+      
+      # Pickup and delivery
+      pickup_delivery_disjunction_penalty: 1000000
+      
+      # Performance tuning
+      use_unassigned_variable: true
+      use_depth_first_search: false
+      optimization_step: 100  # Report progress every N iterations
+      
+    # Distance calculation parameters  
+    distance:
+      use_euclidean_fallback: true  # Use Euclidean distance if route calculation fails
+      manhattan_factor: 1.3         # Factor to convert Euclidean to approximate road distance
+      
+    # Logging and debugging
+    debug:
+      log_search_progress: false  # Log detailed search progress
+      print_assignment: false     # Print final assignment details
+      validate_solution: true     # Validate solution before returning
 
-# Google Maps configuration
+# Google Maps configuration  
 google:
   # API settings
   traffic_model: "BEST_GUESS"  # BEST_GUESS|OPTIMISTIC|PESSIMISTIC
@@ -144,6 +235,78 @@ google:
   maps:
     segment_max_waypoints: 9  # Max waypoints per Google Maps URL
     avoid: []  # tolls, highways, ferries
+
+# Routing provider configuration
+routing:
+  # Provider priority (will try in order until one succeeds)
+  provider_priority: ["here", "ors", "osrm", "straight"]
+  
+  # City rules for truck restrictions
+  city_rules_file: "./config/city_rules.yaml"
+  
+  # Provider-specific settings (API keys should be in environment variables)
+  here:
+    base_url: "https://router.hereapi.com/v8"
+    truck_profile: "truck"
+    avoid_features: ["tollRoad"]
+    
+  ors:
+    base_url: "https://api.openrouteservice.org/v2"
+    profile: "driving-hgv"  # Heavy goods vehicle
+    avoid_features: ["tollways"]
+    
+  osrm:
+    base_url: "http://router.project-osrm.org"
+    profile: "driving"
+    
+  # Fallback settings for straight-line calculation
+  straight_line:
+    speed_factor: 0.6  # Assume 60% efficiency vs straight line
+    city_penalty: 1.2  # 20% penalty for city driving
+
+# Offline distance calculation (replaces Google Distance Matrix API)
+distance_calculation:
+  # Method selection
+  method: "offline"  # "google" (uses Distance Matrix API) or "offline" (uses Haversine + traffic patterns)
+  
+  # Offline calculation parameters
+  offline:
+    # Base speed assumptions for LA traffic
+    base_speed_mph: 25      # Average city driving speed
+    highway_speed_mph: 45   # Average highway speed in LA
+    
+    # Traffic pattern multipliers
+    traffic_patterns:
+      peak_morning: 
+        hours: [7, 10]      # 7 AM to 10 AM
+        speed_factor: 0.6   # 60% of base speed
+      peak_evening:
+        hours: [16, 19]     # 4 PM to 7 PM  
+        speed_factor: 0.65  # 65% of base speed
+      off_peak:
+        speed_factor: 1.0   # 100% of base speed
+      night:
+        hours: [22, 6]      # 10 PM to 6 AM
+        speed_factor: 1.2   # 120% of base speed (less traffic)
+    
+    # Distance calculation adjustments
+    road_network_factor: 1.3  # Multiply Haversine distance to approximate road network
+    downtown_penalty_factor: 1.5  # Additional factor for downtown LA area
+    
+    # Geographic zones (approximate boundaries for LA)
+    zones:
+      downtown_la:
+        lat_min: 34.0
+        lat_max: 34.1
+        lon_min: -118.3
+        lon_max: -118.2
+        speed_factor: 0.7  # Slower speeds downtown
+        
+  # Fallback settings
+  fallback:
+    use_google_if_offline_fails: false  # Whether to fallback to Google API
+    cache_results: true                 # Cache distance calculations
+    max_cache_age_hours: 24            # How long to keep cached results
     
 # Database settings
 database:

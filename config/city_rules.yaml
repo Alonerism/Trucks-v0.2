@@ -1,0 +1,52 @@
+# City-specific truck routing restrictions
+# Used to enforce municipal regulations like "large trucks cannot enter Santa Monica before 08:00"
+
+rules:
+  - name: "Santa Monica Large Truck Restriction"
+    description: "Large trucks cannot enter Santa Monica before 8:00 AM"
+    polygon:
+      # Approximate Santa Monica boundaries (simplified rectangle)
+      - [34.0089, -118.5138]  # Southwest corner
+      - [34.0089, -118.4612]  # Southeast corner  
+      - [34.0416, -118.4612]  # Northeast corner
+      - [34.0416, -118.5138]  # Northwest corner
+    restrictions:
+      large_truck_entry_before: "08:00"
+      applies_to_truck_types: ["large_truck"]
+      
+  - name: "Downtown LA Commercial Hours"
+    description: "Commercial deliveries restricted during peak hours"
+    polygon:
+      # Downtown LA core (simplified)
+      - [34.0400, -118.2800]  # Southwest
+      - [34.0400, -118.2400]  # Southeast
+      - [34.0600, -118.2400]  # Northeast
+      - [34.0600, -118.2800]  # Northwest
+    restrictions:
+      no_commercial_delivery_hours: ["07:00-09:00", "17:00-19:00"]
+      applies_to_truck_types: ["all"]
+
+# Routing provider configuration
+routing:
+  # Provider priority: try HERE first if key available, then ORS, then OSRM, finally straight-line
+  provider_priority: ["here", "ors", "osrm", "straight"]
+  
+  # Provider-specific settings
+  here:
+    base_url: "https://router.hereapi.com/v8"
+    truck_profile: "truck"
+    avoid_features: ["tollRoad"]
+    
+  ors:
+    base_url: "https://api.openrouteservice.org/v2"
+    profile: "driving-hgv"  # Heavy goods vehicle
+    avoid_features: ["tollways"]
+    
+  osrm:
+    base_url: "http://router.project-osrm.org"
+    profile: "driving"
+    
+  # Fallback settings
+  straight_line:
+    speed_factor: 0.6  # Assume 60% of straight-line distance due to road network
+    city_penalty: 1.2  # 20% penalty for city driving

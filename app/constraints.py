@@ -174,15 +174,7 @@ class ConstraintValidator:
         violations = []
         
         # Check job-specific time windows
-        if job.earliest and estimated_time < job.earliest:
-            violations.append(ConstraintViolation(
-                job_id=job.id,
-                truck_id=0,  # Not truck-specific
-                violation_type="too_early",
-                message=f"Arrival {estimated_time} before earliest allowed {job.earliest}",
-                severity="warning"  # Might be soft constraint
-            ))
-        
+        # Early arrivals are allowed with waiting at the stop; don't treat as violation
         if job.latest and estimated_time > job.latest:
             violations.append(ConstraintViolation(
                 job_id=job.id,
@@ -203,13 +195,7 @@ class ConstraintValidator:
                 self.config.constraints.default_location_window_end
             )
             
-            if arrival_time < window_start:
-                violations.append(ConstraintViolation(
-                    job_id=job.id,
-                    truck_id=0,
-                    violation_type="location_window_early",
-                    message=f"Arrival {arrival_time} before location opens at {window_start}"
-                ))
+            # Early arrivals vs. location opening also allowed with waiting on site
             
             if arrival_time > window_end:
                 violations.append(ConstraintViolation(

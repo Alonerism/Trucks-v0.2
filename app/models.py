@@ -5,7 +5,7 @@ Uses SQLModel for database ORM and Pydantic for validation.
 
 from datetime import datetime, time
 from enum import Enum
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Any, Union
 from sqlmodel import SQLModel, Field, Relationship
 from pydantic import BaseModel
 
@@ -34,6 +34,8 @@ class Truck(SQLModel, table=True):
     bed_width_ft: float = Field(gt=0)
     height_limit_ft: Optional[float] = Field(default=None, gt=0)
     large_capable: bool = Field(default=False)
+    # Truck restriction attributes
+    large_truck: bool = Field(default=False, description="Whether this is a large truck subject to municipal restrictions")
     
     # Relationships
     route_assignments: List["RouteAssignment"] = Relationship(back_populates="truck")
@@ -68,17 +70,32 @@ class Item(SQLModel, table=True):
     job_items: List["JobItem"] = Relationship(back_populates="item")
 
 
+class ItemMeta(SQLModel, table=True):
+    """Flexible metadata for items (e.g., hierarchical path), stored as JSON strings.
+
+    This avoids altering the existing Item table and enables storing optional
+    UI-only metadata like breadcrumb paths.
+    """
+    id: Optional[int] = Field(default=None, primary_key=True)
+    item_id: int = Field(foreign_key="item.id", index=True)
+    key: str = Field(index=True)
+    value_json: Optional[str] = Field(default=None)
+
+
 class Job(SQLModel, table=True):
     """Individual pickup or drop job."""
     id: Optional[int] = Field(default=None, primary_key=True)
     location_id: int = Field(foreign_key="location.id")
     action: ActionType
-    priority: int = Field(default=1)  # Higher = more important, but soft
+    priority: int = Field(default=1, ge=0, le=3)  # 0=Critical, 1=Most urgent, 2=Medium, 3=Least urgent
     date: str = Field(index=True)  # YYYY-MM-DD format for scheduled date
     earliest: Optional[datetime] = Field(default=None)
     latest: Optional[datetime] = Field(default=None)
     notes: Optional[str] = Field(default=None)
     created_at: datetime = Field(default_factory=datetime.utcnow)
+    # Soft delete fields
+    is_deleted: bool = Field(default=False, index=True)
+    deleted_at: Optional[datetime] = Field(default=None)
     
     # Relationships
     location: Location = Relationship(back_populates="jobs")
@@ -141,6 +158,77 @@ class UnassignedJob(SQLModel, table=True):
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
 
+# =========================
+# Dispatch & Messaging Models
+# =========================
+
+class Driver(SQLModel, table=True):
+    """Driver directory and assignment mapping.
+
+    A driver can be associated with a truck by name (soft mapping) and has a
+    WhatsApp phone number for messaging.
+    """
+    id: Optional[int] = Field(default=None, primary_key=True)
+    name: str = Field(index=True)
+    phone_e164: Optional[str] = Field(default=None, index=True, description="E.164 phone (e.g., +15551234567)")
+    assigned_truck_id: Optional[int] = Field(default=None, foreign_key="truck.id")
+    active: bool = Field(default=True)
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+class DriverDispatchState(SQLModel, table=True):
+    """Per-day dispatch state for each driver."""
+    id: Optional[int] = Field(default=None, primary_key=True)
+    driver_id: int = Field(foreign_key="driver.id", index=True)
+    date: str = Field(index=True)  # YYYY-MM-DD
+    current_batch_index: int = Field(default=0, ge=0)
+    last_ack_at: Optional[datetime] = Field(default=None)
+    last_sent_at: Optional[datetime] = Field(default=None)
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+class DispatchBatchStop(SQLModel, table=True):
+    """A stop within a 3-stop batch for a driver on a given date."""
+    id: Optional[int] = Field(default=None, primary_key=True)
+    driver_id: int = Field(foreign_key="driver.id", index=True)
+    date: str = Field(index=True)
+    batch_index: int = Field(ge=0, index=True)
+    seq_in_batch: int = Field(ge=0, le=2)
+    job_id: int = Field(foreign_key="job.id")
+    expected_arrival: Optional[datetime] = Field(default=None)
+    expected_departure: Optional[datetime] = Field(default=None)
+    sent_at: Optional[datetime] = Field(default=None)
+    completed_at: Optional[datetime] = Field(default=None)
+
+
+class DispatchMessage(SQLModel, table=True):
+    """Log of WhatsApp messages to/from drivers for audit and learning."""
+    id: Optional[int] = Field(default=None, primary_key=True)
+    driver_id: Optional[int] = Field(default=None, foreign_key="driver.id")
+    date: Optional[str] = Field(default=None, index=True)
+    direction: str = Field(description="inbound|outbound")
+    content: str
+    provider_message_id: Optional[str] = Field(default=None, index=True)
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+class DispatchTimeLog(SQLModel, table=True):
+    """Expected vs actual timing logs for dispatch performance analytics."""
+    id: Optional[int] = Field(default=None, primary_key=True)
+    job_id: int = Field(foreign_key="job.id", index=True)
+    driver_id: int = Field(foreign_key="driver.id", index=True)
+    truck_id: Optional[int] = Field(default=None, foreign_key="truck.id")
+    date: str = Field(index=True)  # YYYY-MM-DD
+    planned_start: Optional[datetime] = Field(default=None)
+    actual_start: Optional[datetime] = Field(default=None)
+    planned_end: Optional[datetime] = Field(default=None)
+    actual_end: Optional[datetime] = Field(default=None)
+    delta_start_minutes: Optional[float] = Field(default=None)  # actual - planned in minutes
+    delta_end_minutes: Optional[float] = Field(default=None)  # actual - planned in minutes
+    notes: Optional[str] = Field(default=None)
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+
 # Pydantic models for API requests/responses
 class TruckResponse(BaseModel):
     """Truck information for API responses."""
@@ -180,10 +268,18 @@ class RouteStopResponse(BaseModel):
     """Route stop for API responses."""
     job: JobResponse
     stop_order: int
+    position: Optional[int] = None
     estimated_arrival: datetime
+    service_start: datetime
     estimated_departure: datetime
     drive_minutes_from_previous: float
     service_minutes: float
+    wait_minutes: Optional[float] = None
+    slack_minutes: Optional[float] = None
+    leg_distance_meters: Optional[float] = None
+    # UI display enhanced fields (post-processed road-aware)
+    display_arrival_seconds: Optional[int] = None  # cumulative seconds from day start
+    display_leg_drive_seconds: Optional[int] = None  # seconds for this leg (road aware)
 
 
 class RouteResponse(BaseModel):
@@ -196,6 +292,17 @@ class RouteResponse(BaseModel):
     total_weight_lb: float
     overtime_minutes: float
     maps_url: str
+    # New: minutes of overtime actually utilized (capped at 60 by fallback strategy)
+    overtime_minutes_used: Optional[float] = None
+    # Display (road-aware) aggregated fields
+    display_drive_seconds: Optional[int] = None
+    display_total_seconds: Optional[int] = None
+    display_total_day_seconds: Optional[int] = None  # includes buffers & calibrator
+    display_source: Optional[str] = None  # osrm|google|offline-fallback
+    # Per-route objective breakdown mirroring global keys (drive/service/overtime/priority_soft_cost/total_cost)
+    objective_breakdown: Optional[Dict[str, Any]] = None
+    # Optional debug payload when debug=1 requested
+    debug: Optional[Dict[str, Any]] = None
 
 
 class OptimizationResult(BaseModel):
@@ -203,18 +310,20 @@ class OptimizationResult(BaseModel):
     date: str
     routes: List[RouteResponse]
     unassigned_jobs: List[JobResponse]
+    unassigned_reasons: Optional[Dict[int, str]] = None
     total_cost: float
     solver_used: str
     computation_time_seconds: float
     output_files: Optional[Dict[str, str]] = None
+    # Optional objective breakdown for transparency (allows nested objects like balance)
+    objective_breakdown: Optional[Dict[str, Any]] = None
+    # New: structured deferred jobs (after applying +1h per-truck overtime fallback)
+    deferred_jobs: Optional[List[Dict[str, Any]]] = None
+    # Aggregated per-truck overtime summary (populated post-optimization)
+    overtime_summary: Optional[List[Dict[str, Any]]] = None
+    # Optional global post-processing annotation
+    display_annotation: Optional[str] = None
 
-
-class OvertimeDecisionRequest(BaseModel):
-    """When overtime exceeds threshold, present both options."""
-    overtime_plan: OptimizationResult
-    defer_plan: OptimizationResult
-    overtime_minutes_diff: float
-    jobs_deferred_count: int
 
 
 # CSV Import models

@@ -142,8 +142,12 @@ class SolutionVisualizer:
             if route.assignments:
                 truck_names.append(route.truck.name)
                 
-                # Calculate weight utilization percentage
-                weight_util_pct = (route.total_weight_lb / route.truck.max_weight_lb) * 100
+                # Calculate weight utilization percentage (clamped 0..100)
+                if route.truck.max_weight_lb and route.truck.max_weight_lb > 0:
+                    weight_util_pct = (route.total_weight_lb / route.truck.max_weight_lb) * 100
+                else:
+                    weight_util_pct = 0
+                weight_util_pct = max(0, min(100, float(weight_util_pct)))
                 weight_utilization.append(weight_util_pct)
                 
                 # Time breakdown
@@ -153,9 +157,13 @@ class SolutionVisualizer:
                 # Number of jobs
                 num_jobs.append(len(route.assignments))
                 
-                # Calculate time utilization (assuming 8-hour workday)
+                # Calculate time utilization (assuming 8-hour workday) and clamp 0..100
                 workday_minutes = 8 * 60  # 8 hours in minutes
-                time_util_pct = (route.total_time_minutes / workday_minutes) * 100
+                if workday_minutes > 0:
+                    time_util_pct = (route.total_time_minutes / workday_minutes) * 100
+                else:
+                    time_util_pct = 0
+                time_util_pct = max(0, min(100, float(time_util_pct)))
                 time_utilization.append(time_util_pct)
         
         if not truck_names:
