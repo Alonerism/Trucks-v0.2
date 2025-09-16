@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Fleet Optimizer UI</title>
+    <style>
+      body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 2rem; }
+      .ok { color: #0a7d00; }
+      .err { color: #b00020; }
+      code { background: #f3f3f3; padding: 2px 6px; border-radius: 4px; }
+      .box { padding: 1rem; border: 1px solid #ddd; border-radius: 8px; max-width: 720px; }
+    </style>
+  </head>
+  <body>
+    <h1>Fleet Optimizer (Minimal UI)</h1>
+    <div class="box">
+      <p>Backend health: <span id="health">checking...</span></p>
+      <p>API base: <code>/api</code></p>
+      <button id="optBtn">Optimize sample day</button>
+      <pre id="out" style="white-space: pre-wrap"></pre>
+    </div>
+    <script>
+      async function checkHealth() {
+        const el = document.getElementById('health');
+        try {
+          const res = await fetch('/api/health');
+          const j = await res.json();
+          el.textContent = j.status === 'ok' ? 'OK' : 'Unexpected';
+          el.className = j.status === 'ok' ? 'ok' : 'err';
+        } catch (e) {
+          el.textContent = 'DOWN';
+          el.className = 'err';
+        }
+      }
+
+      async function optimize() {
+        const out = document.getElementById('out');
+        out.textContent = 'Seeding 1 truck + 5 jobs and optimizing...';
+        try {
+          await fetch('/api/trucks', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: 'T1' })});
+          for (let i = 0; i < 5; i++) {
+            await fetch('/api/jobs', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ address:'A', lat:34.05, lng:-118.25, service_minutes:5, priority:1 })});
+          }
+          const date = new Date().toISOString().slice(0,10);
+          await fetch('/api/optimize', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ date })});
+          const r = await fetch(`/api/routes/1?date=${date}`);
+          const j = await r.json();
+          out.textContent = JSON.stringify(j, null, 2);
+        } catch (e) {
+          out.textContent = 'Error: ' + e;
+        }
+      }
+
+      document.getElementById('optBtn').addEventListener('click', optimize);
+      checkHealth();
+    </script>
+  </body>
+</html>
